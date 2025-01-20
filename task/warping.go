@@ -16,6 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/peanut996/CloudflareWarpSpeedTest/i18n"
+
+	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/poly1305"
+	"golang.zx2c4.com/wireguard/tai64n"
+
 	"github.com/peanut996/CloudflareWarpSpeedTest/utils"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -28,7 +34,6 @@ const (
 	defaultPingTimes            = 10
 	udpConnectTimeout           = time.Millisecond * 1000
 	wireguardHandshakeRespBytes = 92
-	quickModeMaxIpNum           = 1000
 	warpPublicKey               = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 )
 
@@ -37,25 +42,27 @@ var (
 
 	PublicKey string
 
-	QuickMode = false
+	AllMode = false
 
 	IPv6Mode = false
 
-	ScanAllPort = false
+	ReservedString = ""
+
+	reserved = [3]byte{60, 189, 175}
 
 	Routines = defaultRoutines
 
 	PingTimes = defaultPingTimes
 
-	commonIPv4Ports = []int{
+	MaxScanCount = 5000
+
+	ports = []int{
 		500, 854, 859, 864, 878, 880, 890, 891, 894, 903,
 		908, 928, 934, 939, 942, 943, 945, 946, 955, 968,
 		987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387,
 		1701, 1843, 2371, 2408, 2506, 3138, 3476, 3581, 3854, 4177,
 		4198, 4233, 4500, 5279, 5956, 7103, 7152, 7156, 7281, 7559, 8319, 8742, 8854, 8886,
 	}
-
-	commonIPv6Ports = []int{2408, 500, 1701, 4500}
 
 	commonIPv4CIDRs = []string{
 		"162.159.192.0/24",
@@ -69,13 +76,22 @@ var (
 	}
 
 	commonIPv6CIDRs = []string{
-		"2606:4700:d0::/48",
+		"2606:4700:100::/48",
 	}
 
-	MaxWarpPortRange = 10000
-
-	warpHandshakePacket, _ = hex.DecodeString("0100000030ec356d08af3939c1b09d3143c2e3773be539e4c7be2e2996e043f1871497be7ed28138b0473350f28647ca3013fe8de10f1ec7e448542c0ef0f0c5b2976455b6bc3f0224d06f14abfbabb7fc8753865f6dad38d7b1c2156c6cea13f57edc39c6627139659075a1c25d49743a86a40517ec45cf8e151bf0796b3f992070839600000000000000000000000000000000")
+	warpHandshakePacket, _ = hex.DecodeString("013cbdafb4135cac96a29484d7a0175ab152dd3e59be35049beadf758b8d48af14ca65f25a168934746fe8bc8867b1c17113d71c0fac5c141ef9f35783ffa5357c9871f4a006662b83ad71245a862495376a5fe3b4f2e1f06974d748416670e5f9b086297f652e6dfbf742fbfc63c3d8aeb175a3e9b7582fbc67c77577e4c0b32b05f92900000000000000000000000000000000")
 )
+
+type MessageInitiation struct {
+	Type      uint8
+	Reserved  [3]byte
+	Sender    uint32
+	Ephemeral device.NoisePublicKey
+	Static    [device.NoisePublicKeySize + poly1305.TagSize]byte
+	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
+	MAC1      [blake2s.Size128]byte
+	MAC2      [blake2s.Size128]byte
+}
 
 type UDPAddr struct {
 	IP   *net.IPAddr
@@ -100,7 +116,7 @@ func NewWarping() *Warping {
 		ips:     ips,
 		csv:     make(utils.PingDelaySet, 0),
 		control: make(chan bool, Routines),
-		bar:     utils.NewBar(len(ips), "Available:", ""),
+		bar:     utils.NewBar(len(ips), i18n.QueryI18n(i18n.Available), ""),
 	}
 }
 
@@ -146,7 +162,7 @@ func (w *Warping) warpingHandler(ip *UDPAddr) {
 	}
 	data := &utils.PingData{
 		IP:       ip.ToUDPAddr(),
-		Sended:   PingTimes,
+		Sent:     PingTimes,
 		Received: recv,
 		Delay:    totalDelay / time.Duration(recv),
 	}
@@ -164,25 +180,15 @@ func (w *Warping) appendIPData(data *utils.PingData) {
 func loadWarpIPRanges() (ipAddrs []*UDPAddr) {
 	ips := loadIPRanges()
 	addrs := generateIPAddrs(ips)
-	if QuickMode && len(addrs) > quickModeMaxIpNum && !IPv6Mode {
-		return addrs[:quickModeMaxIpNum]
+	if !AllMode && len(addrs) > MaxScanCount {
+		return addrs[:MaxScanCount]
 	}
 	return addrs
 }
 
 func generateIPAddrs(ips []*net.IPAddr) (udpAddrs []*UDPAddr) {
-	rangePorts := commonIPv4Ports
-	if IPv6Mode {
-		rangePorts = commonIPv6Ports
-	}
-	if !ScanAllPort {
-		for _, port := range rangePorts {
-			udpAddrs = append(udpAddrs, generateSingleIPAddr(ips, port)...)
-		}
-	} else {
-		for port := 1; port <= MaxWarpPortRange; port++ {
-			udpAddrs = append(udpAddrs, generateSingleIPAddr(ips, port)...)
-		}
+	for _, port := range ports {
+		udpAddrs = append(udpAddrs, generateSingleIPAddr(ips, port)...)
 	}
 	shuffleAddrs(&udpAddrs)
 	return udpAddrs
@@ -214,14 +220,14 @@ func (i *UDPAddr) ToUDPAddr() (addr *net.UDPAddr) {
 
 func (w *Warping) warping(ip *UDPAddr) (received int, totalDelay time.Duration) {
 	fullAddress := ip.FullAddress()
-	conn, err := net.DialTimeout("udp", fullAddress, udpConnectTimeout)
+	con, err := net.DialTimeout("udp", fullAddress, udpConnectTimeout)
 	if err != nil {
 		return 0, 0
 	}
-	defer conn.Close()
+	defer con.Close()
 
 	for i := 0; i < PingTimes; i++ {
-		ok, rtt := handshake(conn)
+		ok, rtt := handshake(con)
 		if ok {
 			received++
 			totalDelay += rtt
@@ -264,6 +270,17 @@ func shuffleAddrs(udpAddrs *[]*UDPAddr) {
 }
 
 func InitHandshakePacket() {
+	if ReservedString != "" {
+		if PrivateKey == "" {
+			log.Fatalln(i18n.QueryI18n(i18n.ReservedEmptyError))
+		}
+		r, err := utils.ParseReservedString(ReservedString)
+		if err != nil {
+			log.Fatalln(i18n.QueryI18n(i18n.ReservedParseError) + err.Error())
+		}
+		reserved = r
+	}
+
 	if PrivateKey == "" && PublicKey == "" {
 		return
 	}
@@ -274,12 +291,12 @@ func InitHandshakePacket() {
 
 	pri, err := getNoisePrivateKeyFromBase64(PrivateKey)
 	if err != nil {
-		log.Fatalln("Failed to parse private key: " + err.Error())
+		log.Fatalln(i18n.QueryI18n(i18n.PrivateKeyParseError) + err.Error())
 	}
 
 	pub, err := getNoisePublicKeyFromBase64(PublicKey)
 	if err != nil {
-		log.Fatalln("Failed to parse public key: " + err.Error())
+		log.Fatalln(i18n.QueryI18n(i18n.PublicKeyParseError) + err.Error())
 	}
 
 	packet := buildHandshakePacket(pri, pub)
@@ -290,7 +307,7 @@ func InitHandshakePacket() {
 func buildHandshakePacket(pri device.NoisePrivateKey, pub device.NoisePublicKey) []byte {
 	d, _, err := netstack.CreateNetTUN([]netip.Addr{}, []netip.Addr{}, 1480)
 	if err != nil {
-		log.Fatalln("Failed to build handshake packet: " + err.Error())
+		log.Fatalln(i18n.QueryI18n(i18n.HandshakePacketBuildFailed) + err.Error())
 	}
 	dev := device.NewDevice(d, conn.NewDefaultBind(), device.NewLogger(0, ""))
 
@@ -298,22 +315,29 @@ func buildHandshakePacket(pri device.NoisePrivateKey, pub device.NoisePublicKey)
 
 	peer, err := dev.NewPeer(pub)
 	if err != nil {
-		log.Fatalln("Failed to build handshake packet: " + err.Error())
+		log.Fatalln(i18n.QueryI18n(i18n.HandshakePacketBuildFailed) + err.Error())
 	}
 	msg, err := dev.CreateMessageInitiation(peer)
 	if err != nil {
-		log.Fatalln("Failed to build handshake packet: " + err.Error())
+		log.Fatalln(i18n.QueryI18n(i18n.HandshakePacketBuildFailed) + err.Error())
 	}
 
 	var buf [device.MessageInitiationSize]byte
 	writer := bytes.NewBuffer(buf[:0])
+
 	binary.Write(writer, binary.LittleEndian, msg)
 	packet := writer.Bytes()
 
 	generator := device.CookieGenerator{}
 	generator.Init(pub)
 	generator.AddMacs(packet)
+
+	AddReserved(packet)
 	return packet
+}
+
+func AddReserved(packet []byte) {
+	packet[1], packet[2], packet[3] = reserved[0], reserved[1], reserved[2]
 }
 
 func getNoisePrivateKeyFromBase64(b string) (device.NoisePrivateKey, error) {
@@ -345,10 +369,10 @@ func getNoisePublicKeyFromBase64(b string) (device.NoisePublicKey, error) {
 func encodeBase64ToHex(key string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
-		return "", errors.New("Invalid base64 string: " + key)
+		return "", errors.New(i18n.QueryI18n(i18n.Base64Invalid) + key)
 	}
 	if len(decoded) != 32 {
-		return "", errors.New("Noise key should be 32 bytes: " + key)
+		return "", errors.New(i18n.QueryI18n(i18n.NoiseKeyInvalid) + key)
 	}
 	return hex.EncodeToString(decoded), nil
 }
